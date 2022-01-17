@@ -1,19 +1,23 @@
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, Iterator
 
 import databases
 import enum
 
+import jwt
 import sqlalchemy
 import uvicorn
+from databases.backends.postgres import Record
 from email_validator import EmailNotValidError, validate_email as ve
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Depends
 from decouple import config
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from pydantic import BaseModel, validator
 
 from passlib.context import CryptContext
+from starlette.requests import Request
 
 DATABASE_URL = (
     f"postgresql://{config('DB_USER')}:"
@@ -22,6 +26,15 @@ DATABASE_URL = (
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
+
+app = FastAPI()
+pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
+
+
+class UserRole(enum.Enum):
+    super_admin = "super admin"
+    admin = "admin"
+    user = "user"
 
 
 class ColorEnum(enum.Enum):
@@ -61,6 +74,12 @@ users = sqlalchemy.Table(
         server_default=sqlalchemy.func.now(),
         onupdate=sqlalchemy.func.now(),
     ),
+    sqlalchemy.Column(
+        "role",
+        sqlalchemy.Enum(UserRole),
+        nullable=False,
+        server_default=UserRole.user.name,
+    ),
 )
 
 clothes = sqlalchemy.Table(
@@ -87,17 +106,32 @@ clothes = sqlalchemy.Table(
 )
 
 
-app = FastAPI()
-pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
+def is_admin(request: Request) -> None:
+    user = request.state.user
+    if not user or user["role"] not in (UserRole.admin, UserRole.super_admin):
+        raise HTTPException(
+            403, "You do not have permissions for this resource"
+        )
+
+
+def create_access_token(user: Record) -> Optional[str]:
+    try:
+        payload = {
+            "sub": user["id"],
+            "exp": datetime.utcnow() + timedelta(minutes=120),
+        }
+        return jwt.encode(payload, config("JWT_SECRET"), algorithm="HS256")
+    except Exception:
+        raise
 
 
 class EmailField(str):
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator:
         yield cls.validate
 
     @classmethod
-    def validate(cls, value) -> str:
+    def validate(cls, value: str) -> str:
         try:
             ve(value)
             return value
@@ -110,7 +144,7 @@ class BaseUser(BaseModel):
     full_name: Optional[str]
 
     @validator("full_name")
-    def validate_full_name(cls, value):
+    def validate_full_name(cls, value: str):
         try:
             assert len(value.split()) == 2
             return value
@@ -128,6 +162,47 @@ class UserSignOut(BaseUser):
     last_modified_at: datetime
 
 
+class ClothesBase(BaseModel):
+    name: str
+    color: str
+    size: SizeEnum
+    color: ColorEnum
+
+
+class ClothesIn(ClothesBase):
+    pass
+
+
+class ClothesOut(ClothesBase):
+    id: int
+    created_at: datetime
+    last_modified_at: datetime
+
+
+class CustomHTTPBearer(HTTPBearer):
+    async def __call__(
+        self, request: Request
+    ) -> Optional[HTTPAuthorizationCredentials]:
+        res = await super().__call__(request)
+
+        try:
+            payload = jwt.decode(
+                res.credentials, config("JWT_SECRET"), algorithms=["HS256"]
+            )
+            user = await database.fetch_one(
+                users.select().where(users.c.id == payload["sub"])
+            )
+            request.state.user = user
+            return payload
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(401, "Token is expired")
+        except jwt.InvalidTokenError:
+            raise HTTPException(401, "Invalid token")
+
+
+oauth2_scheme = CustomHTTPBearer()
+
+
 @app.on_event("startup")
 async def startup() -> None:
     await database.connect()
@@ -138,20 +213,32 @@ async def shutdown() -> None:
     await database.disconnect()
 
 
-@app.post("/register", response_model=UserSignOut)
-async def create_user(user: UserSignIn):
+@app.get("/clothes", dependencies=[Depends(oauth2_scheme)])
+async def get_all_clothes() -> list:
+    return await database.fetch_all(clothes.select())
+
+
+@app.post(
+    "/clothes",
+    response_model=ClothesOut,
+    dependencies=[Depends(oauth2_scheme), Depends(is_admin)],
+    status_code=201,
+)
+async def create_clothes(clothes_data: ClothesIn) -> Record:
+    id_ = await database.execute(clothes.insert().values(**clothes_data.dict()))
+    return await database.fetch_one(clothes.select().where(clothes.c.id == id_))
+
+
+@app.post("/register")
+async def create_user(user: UserSignIn) -> dict:
     user.password = pwd_context.hash(user.password)
     q = users.insert().values(**user.dict())
     id_ = await database.execute(q)
     created_user = await database.fetch_one(
         users.select().where(users.c.id == id_)
     )
-    return created_user
-
-
-@app.get("/all")
-async def get_all_users() -> list:
-    return await database.fetch_all(users.select())
+    token = create_access_token(created_user)
+    return {"token": token}
 
 
 if __name__ == "__main__":
