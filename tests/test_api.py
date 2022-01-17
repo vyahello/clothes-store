@@ -14,12 +14,6 @@ def client() -> TestClient:
         yield cl
 
 
-def test_all_users(client: TestClient) -> None:
-    users = client.get(f"{URL}/all").json()
-    assert isinstance(users, list)
-    assert users
-
-
 def test_register_user(client: TestClient) -> None:
     resp = client.post(
         f"{URL}/register",
@@ -30,3 +24,11 @@ def test_register_user(client: TestClient) -> None:
         },
     )
     assert resp.status_code == 200
+
+
+def test_create_clothes_non_admin(client: TestClient) -> None:
+    resp = client.post(
+        f"{URL}/clothes",
+        json={"name": uuid.uuid4().hex, "color": "pink", "size": "xs"},
+    )
+    assert resp.status_code == 403
