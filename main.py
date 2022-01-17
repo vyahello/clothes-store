@@ -146,7 +146,6 @@ async def create_user(user: UserSignIn):
     created_user = await database.fetch_one(
         users.select().where(users.c.id == id_)
     )
-    breakpoint()
     return created_user
 
 
