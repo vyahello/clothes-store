@@ -1,0 +1,5 @@
+pytest==6.2.5
+black==21.12b0
+flake8==4.0.1
+coverage==6.2
+coveralls==3.3.1
